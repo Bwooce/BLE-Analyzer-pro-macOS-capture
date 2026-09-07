@@ -40,12 +40,20 @@
 extern bool g_following;
 extern uint32_t g_follow_aa;
 
+/*
+ * -B: mark the Access Address and CRCInit fields of the AA 81 payload as
+ * valid (flags bits 0x10 and 0x20).  Defined in wch_capture.c.  See
+ * wch_reconfig_capture() for why this is opt-in.
+ */
+extern bool g_aa81_mark_fields;
+
 /* ── Protocol constants ─────────────────────────────────────────────────── */
 
 #define WCH_MAGIC 0xAA      /* command magic byte */
 #define CMD_IDENTIFY 0x84   /* identify/arm */
 #define CMD_BLE_CONFIG 0x81 /* BLE monitor config + start */
 #define CMD_SCAN_START 0xA1 /* start scan trigger */
+#define CMD_LL_UPDATE 0x82  /* relay an LL control PDU (conn param update) */
 
 /* "BLEAnalyzer&IAP" – 15-byte ASCII string used in the identify command */
 static const uint8_t IAP_STR[15] = {'B', 'L', 'E', 'A', 'n', 'a', 'l', 'y',
@@ -58,6 +66,29 @@ static const uint8_t IAP_STR[15] = {'B', 'L', 'E', 'A', 'n', 'a', 'l', 'y',
 
 /* BLE advertising access address (little-endian) */
 #define BLE_ADV_AA UINT32_C(0x8E89BED6)
+
+/* Advertising Access Address / CRCInit as they sit in the AA 81 payload.
+ * Confirmed against the device's own AA A1 config read-back. */
+static const uint8_t ADV_AA_BYTES[4] = {0xD6, 0xBE, 0x89, 0x8E};
+static const uint8_t ADV_CRCINIT[3] = {0x55, 0x55, 0x55};
+
+/* AA 81 flags byte bits (firmware treats this as a field-presence mask). */
+#define F81_START 0x01    /* begin capturing                       */
+#define F81_CHANNEL 0x02  /* frame[6] holds a channel              */
+#define F81_AA_VALID 0x10 /* frame[15..18] holds an Access Address */
+#define F81_CRC_VALID 0x20/* frame[19..21] holds a CRCInit         */
+
+/*
+ * Check an AA A1 config read-back against what we asked for.  The echo is
+ * 55 01 19 00 followed by the accepted 25-byte payload, so the field offsets
+ * are identical to the command frame's.  Returns true when they agree.
+ */
+static bool echo_matches(const uint8_t *resp, int got, const uint8_t aa[4],
+                         const uint8_t crc[3]) {
+  if (got < 29 || resp[0] != 0x55 || resp[1] != 0x01)
+    return false;
+  return memcmp(resp + 15, aa, 4) == 0 && memcmp(resp + 19, crc, 3) == 0;
+}
 
 /* Minimum payload bytes in a data frame */
 #define MIN_DATA_PAYLOAD 18 /* 12 meta + 6 addr */
@@ -224,20 +255,58 @@ int wch_start_capture(wch_device_t *dev, const wch_capture_config_t *cfg) {
   frame[1] = CMD_BLE_CONFIG;
   frame[2] = 0x19; /* payload len = 25 */
   frame[3] = 0x00;
-  frame[4] = 0x01; /* BLE monitor mode flag */
-  if (cfg->ble_channel)
-    frame[4] |= 0x02; /* channel-nonzero flag (RE: bit set when ch != 0) */
+  frame[4] = F81_START; /* BLE monitor mode flag */
   frame[5] = cfg->phy ? cfg->phy : 1; /* PHY: 1=1M 2=2M 3/4=Coded */
-  frame[6] = cfg->ble_channel;        /* BLE adv channel: 37/38/39 (0 = all) */
+  frame[6] = cfg->ble_channel;        /* channel: adv 37/38/39, or data 0-36 */
   /* bytes [7..28] = zeros (no MAC filters, no LTK, no pass-key) */
-  if (cfg->follow_conn) {
-    /* Write the full 22-byte LLData payload strictly extracted from the
-     * CONNECT_IND. This precisely configures the CH582F silicon's Access
-     * Address (bytes 0-3), CRCInit (bytes 4-6), HopIncrement, and Channel Map
-     * directly from the C structure. If CRCInit is omitted (0x000000), the
-     * hardware will drop all valid data opcodes due to intentional CRC failure!
-     */
-    memcpy(frame + 7, cfg->conn_req_data, 22);
+
+  /*
+   * Are we starting directly on a known connection, or on advertising?
+   * conn_req_data holds the 22-byte LLData from a CONNECT_IND: Access Address
+   * in bytes 0..3, CRCInit in 4..6.  All-zero means we have no connection.
+   */
+  static const uint8_t no_conn[22] = {0};
+  bool have_conn =
+      cfg->follow_conn && memcmp(cfg->conn_req_data, no_conn, 22) != 0;
+
+  /*
+   * Channel-present bit.  On advertising a zero channel legitimately means
+   * "all three advertising channels", so the bit stays conditional.  On a
+   * connection the channel is an explicit data channel and 0 is a valid one,
+   * so the bit must be unconditional -- the same reasoning as
+   * wch_reconfig_capture().
+   */
+  if (have_conn || cfg->ble_channel)
+    frame[4] |= F81_CHANNEL;
+
+  /*
+   * Access Address and CRCInit.
+   *
+   * This used to be `memcpy(frame + 7, cfg->conn_req_data, 22)`, which
+   * splattered the whole LLData across frame[7..28] and so overwrote the
+   * reserved word, MAC filter #1, the Access Address, CRCInit, the frame[22]
+   * bitfield and MAC filter #2 all at once, landing the LLData's own Access
+   * Address at frame[7..10] instead of frame[15..18].  It only ever appeared
+   * harmless because the reconfig path immediately rewrote the two fields that
+   * matter.  The real layout is confirmed three ways: the AA 81 payload
+   * builder at 0x14028c280 in BleAnalyzer64.exe, the device's own AA A1 config
+   * read-back, and the firmware's AA 81 handler.
+   *
+   * The firmware only copies either field when its presence bit is set, so the
+   * values and the bits must travel together.  Stating the advertising
+   * defaults explicitly when there is no connection is what recovers a radio
+   * left holding a stale connection Access Address by an earlier session,
+   * without needing a USB reset.
+   */
+  if (g_aa81_mark_fields) {
+    if (have_conn) {
+      memcpy(frame + 15, cfg->conn_req_data, 4);     /* Access Address */
+      memcpy(frame + 19, cfg->conn_req_data + 4, 3); /* CRCInit        */
+    } else {
+      memcpy(frame + 15, ADV_AA_BYTES, 4);
+      memcpy(frame + 19, ADV_CRCINIT, 3);
+    }
+    frame[4] |= F81_AA_VALID | F81_CRC_VALID;
   }
 
   r = bulk_write(dev, frame, 4 + 25);
@@ -263,13 +332,24 @@ int wch_start_capture(wch_device_t *dev, const wch_capture_config_t *cfg) {
   if (r != 0 && r != LIBUSB_ERROR_TIMEOUT)
     return r;
 
-  /* Read the 29-byte status echo (55 01 19 00 …) */
+  /* Read the 29-byte status echo (55 01 19 00 …) and check it agreed. */
   r = bulk_read(dev, resp, sizeof(resp), &got, 1000);
   if (r == 0 && got >= 1)
     fprintf(stderr,
             "[wch bus=%d addr=%d] AA A1 response: %d bytes "
             "(magic=0x%02X type=0x%02X)\n",
             dev->bus, dev->addr, got, resp[0], got > 1 ? resp[1] : 0);
+
+  if (g_aa81_mark_fields && !have_conn) {
+    if (r == 0 && got >= 29 &&
+        !echo_matches(resp, got, ADV_AA_BYTES, ADV_CRCINIT))
+      fprintf(stderr,
+              "[wch bus=%d addr=%d] WARNING: config read-back disagrees. "
+              "AA=%02X%02X%02X%02X CRCInit=%02X%02X%02X (wanted D6BE898E / "
+              "555555). This radio may not hear advertising.\n",
+              dev->bus, dev->addr, resp[18], resp[17], resp[16], resp[15],
+              resp[21], resp[20], resp[19]);
+  }
 
   return 0;
 }
@@ -291,9 +371,24 @@ int wch_reconfig_capture(wch_device_t *dev, const wch_capture_config_t *cfg) {
   frame[1] = CMD_BLE_CONFIG;
   frame[2] = 0x19;
   frame[3] = 0x00;
-  frame[4] = 0x01; /* BLE monitor mode flag */
-  if (cfg->ble_channel)
-    frame[4] |= 0x02; /* Must set bit 1 for non-zero channels! */
+  frame[4] = F81_START; /* BLE monitor mode flag */
+  /*
+   * The channel-present bit must be set unconditionally here.
+   *
+   * BLE data channel 0 is a perfectly valid channel, but the old
+   * `if (cfg->ble_channel)` test left the bit clear for it.  The firmware only
+   * reads frame[6] when the bit is set, so whenever CSA#1 or CSA#2 selected
+   * channel 0 the radio was simply never retuned, and that connection event
+   * was missed.  Measured at 15 of 126 retunes with a channel map of {0..7},
+   * roughly one event in eight.
+   *
+   * This function only ever runs while following a connection, where the
+   * channel is always an explicit data channel in 0..36, so there is no
+   * "unspecified" case to preserve.  wch_start_capture() keeps the
+   * conditional, because there a zero channel genuinely means "all
+   * advertising channels".
+   */
+  frame[4] |= F81_CHANNEL;
   frame[5] = cfg->phy ? cfg->phy : 1;
   frame[6] = cfg->ble_channel;
 
@@ -308,7 +403,16 @@ int wch_reconfig_capture(wch_device_t *dev, const wch_capture_config_t *cfg) {
      * explicit Access Address, CRCInit, and RF Channel via these exact offsets:
      *   frame[15] = Access Address (4 bytes)
      *   frame[19] = CRCInit (3 bytes)
-     *   frame[23] = Channel Index (0-39)
+     *
+     * Both offsets are CONFIRMED against the AA 81 payload builder at
+     * 0x14028c280 in BleAnalyzer64.exe, which writes the default values
+     * 0x8E89BED6 to frame[15..18] and 0x555555 to frame[19..21].
+     *
+     * The channel is frame[6] (set above), NOT frame[23].  frame[23..28] is
+     * MAC filter #2 in the Windows layout; the old `frame[23] = cfg->channel`
+     * write here was scribbling into that field.  It was harmless only
+     * because its presence bit (0x80) is never set, so the removal below is
+     * a pure correctness fix and is not gated behind any flag.
      */
     /* The first 4 bytes of conn_req_data contain the Access Address */
     memcpy(frame + 15, cfg->conn_req_data, 4);
@@ -316,8 +420,22 @@ int wch_reconfig_capture(wch_device_t *dev, const wch_capture_config_t *cfg) {
     /* The next 3 bytes (conn_req_data[4..6]) contain the CRCInit */
     memcpy(frame + 19, cfg->conn_req_data + 4, 3);
 
-    /* The active data channel is passed in cfg->channel */
-    frame[23] = cfg->channel;
+    /*
+     * Field-validity flags.  The Windows application always marks the Access
+     * Address (0x10) and CRCInit (0x20) fields as valid, even when it is only
+     * supplying the advertising defaults.  This tool has never set them, so
+     * the firmware may be ignoring the connection AA/CRCInit written above.
+     *
+     * Opt-in (-B) rather than default: it changes a path that currently
+     * captures data-channel traffic, and the bits are inferred from the
+     * Windows builder, not observed on the wire.
+     *
+     * Deliberately NOT set here: bit 0x04, which the Windows builder sets
+     * unconditionally (`or al, 4`).  Its meaning is unknown, and including it
+     * would make the -B experiment untestable as a single variable.
+     */
+    if (g_aa81_mark_fields)
+      frame[4] |= F81_AA_VALID | F81_CRC_VALID;
   }
 
   r = bulk_write(dev, frame, 4 + 25);
@@ -335,6 +453,109 @@ int wch_reconfig_capture(wch_device_t *dev, const wch_capture_config_t *cfg) {
     return r;
 
   return 0;
+}
+
+/* ── wch_send_ll_update ───────────────────────────────────────────────────
+ *
+ * AA 82: relay a Link Layer control PDU to the MCU so its firmware can apply
+ * the new connection parameters at the Instant carried in the PDU.
+ *
+ * Wire format, recovered from the AA 82 sender at 0x14028c6d0 in
+ * BleAnalyzer64.exe:
+ *
+ *     AA 82 <len:u16 LE> <payload[len]>          (len < 508)
+ *
+ * The payload is the LL Control PDU verbatim, starting at its two-byte data
+ * channel header:
+ *
+ *     [hdr0][len][opcode][params…]
+ *
+ * so the opcode lands at payload[2] = frame[6], which is where the firmware
+ * reads its selector.  The Windows application sends this for exactly three
+ * device packet types — 0x13 LL_CTRL_CONN_UPDATE_IND, 0x14
+ * LL_CTRL_CHANNEL_MAP_REQ and 0x2B LL_CTRL_PHY_UPDATE_IND — whose LL opcodes
+ * are 0x00, 0x01 and 0x18, matching the firmware's three selectors.
+ *
+ * The Windows sender does not read a response, so neither do we.
+ *
+ * Caller must pass a PDU whose opcode is at pdu[2]; a control PDU carrying a
+ * CTE Info byte shifts the opcode to pdu[3] and must NOT be relayed verbatim.
+ * See the guard in on_packet().
+ *
+ * Returns 0 on success, negative libusb error otherwise.
+ */
+int wch_send_ll_update(wch_device_t *dev, const uint8_t *pdu, int pdu_len) {
+  uint8_t frame[4 + 64];
+
+  if (!dev || !dev->is_open || !pdu)
+    return LIBUSB_ERROR_INVALID_PARAM;
+  /* Need at least [hdr0][len][opcode]; cap at what one frame can carry. */
+  if (pdu_len < 3 || pdu_len > (int)sizeof(frame) - 4)
+    return LIBUSB_ERROR_INVALID_PARAM;
+
+  frame[0] = WCH_MAGIC;
+  frame[1] = CMD_LL_UPDATE;
+  frame[2] = (uint8_t)(pdu_len & 0xFF);
+  frame[3] = (uint8_t)((pdu_len >> 8) & 0xFF);
+  memcpy(frame + 4, pdu, (size_t)pdu_len);
+
+  int r = bulk_write(dev, frame, 4 + pdu_len);
+  return (r == LIBUSB_ERROR_TIMEOUT) ? 0 : r;
+}
+
+/* ── wch_park_advertising ─────────────────────────────────────────────────
+ *
+ * Return one MCU to advertising monitoring: advertising Access Address and
+ * CRCInit, on @ble_channel, with the presence bits set so the firmware
+ * actually copies them.  Used after a followed connection ends, and any time a
+ * radio needs rescuing from a stale connection Access Address.
+ *
+ * Returns 0 if the device's config read-back confirms the advertising values,
+ * 1 if the command was sent but the read-back disagreed or was missing, or a
+ * negative libusb error.
+ */
+int wch_park_advertising(wch_device_t *dev, uint8_t phy, uint8_t ble_channel) {
+  uint8_t frame[64], resp[64];
+  int got = 0, r;
+
+  if (!dev || !dev->is_open)
+    return LIBUSB_ERROR_INVALID_PARAM;
+
+  memset(frame, 0, sizeof(frame));
+  frame[0] = WCH_MAGIC;
+  frame[1] = CMD_BLE_CONFIG;
+  frame[2] = 0x19;
+  frame[3] = 0x00;
+  frame[4] = F81_START | F81_AA_VALID | F81_CRC_VALID;
+  if (ble_channel)
+    frame[4] |= F81_CHANNEL;
+  frame[5] = phy ? phy : 1;
+  frame[6] = ble_channel;
+  memcpy(frame + 15, ADV_AA_BYTES, 4);
+  memcpy(frame + 19, ADV_CRCINIT, 3);
+
+  r = bulk_write(dev, frame, 4 + 25);
+  if (r != 0 && r != LIBUSB_ERROR_TIMEOUT)
+    return r;
+
+  /* Drain whatever the config write shook loose before asking for the echo. */
+  bulk_read(dev, resp, sizeof(resp), &got, 100);
+
+  uint8_t a1[4] = {WCH_MAGIC, CMD_SCAN_START, 0x00, 0x00};
+  r = bulk_write(dev, a1, sizeof(a1));
+  if (r != 0 && r != LIBUSB_ERROR_TIMEOUT)
+    return r;
+
+  /* The echo can arrive behind a few packet frames; look for it briefly. */
+  for (int i = 0; i < 8; i++) {
+    got = 0;
+    r = bulk_read(dev, resp, sizeof(resp), &got, 200);
+    if (r != 0 || got <= 0)
+      continue;
+    if (resp[0] == 0x55 && resp[1] == 0x01)
+      return echo_matches(resp, got, ADV_AA_BYTES, ADV_CRCINIT) ? 0 : 1;
+  }
+  return 1;
 }
 
 int wch_stop_capture(wch_device_t *dev) {

@@ -242,6 +242,34 @@ int wch_start_capture(wch_device_t *dev, const wch_capture_config_t *cfg);
 int wch_reconfig_capture(wch_device_t *dev, const wch_capture_config_t *cfg);
 
 /**
+ * Relay a Link Layer control PDU to one MCU with the AA 82 command, so the
+ * firmware can apply new connection parameters at the PDU's Instant.
+ *
+ * @pdu must be the LL control PDU starting at its two-byte data channel
+ * header, i.e. [hdr0][len][opcode][params…], with the opcode at pdu[2].
+ * Only opcodes 0x00 (CONNECTION_UPDATE_IND), 0x01 (CHANNEL_MAP_IND) and
+ * 0x18 (PHY_UPDATE_IND) are meaningful to the firmware.
+ *
+ * Fire-and-forget: no response is read, matching the Windows application.
+ * Returns 0 on success, negative libusb error otherwise.
+ */
+int wch_send_ll_update(wch_device_t *dev, const uint8_t *pdu, int pdu_len);
+
+/**
+ * Return one MCU to advertising monitoring on @ble_channel, restoring the
+ * advertising Access Address (0x8E89BED6) and CRCInit (0x555555) with the
+ * AA 81 field-presence bits set so the firmware actually applies them.
+ *
+ * Without those bits a radio that has been given a connection's Access Address
+ * can never be given the advertising one back, and stays silently deaf.
+ *
+ * Returns 0 when the config read-back confirms the advertising values, 1 when
+ * the command was sent but the read-back disagreed or did not arrive, or a
+ * negative libusb error.
+ */
+int wch_park_advertising(wch_device_t *dev, uint8_t phy, uint8_t ble_channel);
+
+/**
  * Send the capture stop command to one MCU.
  * Returns 0 on success.
  */
